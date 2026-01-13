@@ -12,7 +12,7 @@ from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
 from reportlab.lib.units import inch
 
-st.set_page_config(page_title="Quote-to-PO Demo (v2.1)", layout="wide")
+st.set_page_config(page_title="Quote-to-PO Demo (v2.2)", layout="wide")
 
 CURRENCIES = ["AED", "SAR", "QAR", "OMR", "BHD", "KWD", "USD", "EUR"]
 
@@ -29,10 +29,18 @@ def sim(a: str, b: str) -> float:
     return SequenceMatcher(None, normalize_desc(a), normalize_desc(b)).ratio()
 
 def safe_float(x):
-    if x is None or (isinstance(x, float) and np.isnan(x)):
+    if x is None:
         return None
-    if isinstance(x, (int, float)):
-        return float(x)
+    try:
+        if isinstance(x, float) and np.isnan(x):
+            return None
+    except Exception:
+        pass
+    if isinstance(x, (int, float, np.integer, np.floating)):
+        try:
+            return float(x)
+        except Exception:
+            return None
     s = str(x).strip()
     if not s or s.lower() in ["nan", "none", "null"]:
         return None
@@ -43,7 +51,7 @@ def safe_float(x):
     except Exception:
         return None
 
-def is_blank_desc(v):
+def is_blank(v):
     if v is None:
         return True
     try:
@@ -52,7 +60,7 @@ def is_blank_desc(v):
     except Exception:
         pass
     s = str(v).strip()
-    return (s == "" or s.lower() in ["nan", "none", "null"])
+    return s == "" or s.lower() in ["nan", "none", "null"]
 
 def detect_columns(cols):
     cols_l = {str(c).strip().lower(): c for c in cols}
@@ -73,18 +81,19 @@ def detect_columns(cols):
 
 def df_to_items(df: pd.DataFrame, colmap: dict):
     items = []
+    header_noise = {"CLIENT DETAILS", "QUOTATION", "QUOTATION DETAILS", "SCOPE SUMMARY"}
     for _, r in df.iterrows():
         desc_raw = r.get(colmap.get("description", ""), "")
-        desc = "" if is_blank_desc(desc_raw) else str(desc_raw).strip()
+        desc = "" if is_blank(desc_raw) else str(desc_raw).strip()
 
         qty = safe_float(r.get(colmap.get("qty", ""), None))
         unit = r.get(colmap.get("unit", ""), "")
-        unit = "" if is_blank_desc(unit) else str(unit).strip()
+        unit = "" if is_blank(unit) else str(unit).strip()
 
         unit_price = safe_float(r.get(colmap.get("unit_price", ""), None))
         total = safe_float(r.get(colmap.get("total", ""), None))
 
-        if desc and desc.upper() in ["CLIENT DETAILS", "QUOTATION", "QUOTATION DETAILS", "SCOPE SUMMARY"]:
+        if desc and desc.upper() in header_noise:
             continue
 
         if desc == "" and qty is None and unit_price is None and total is None:
@@ -117,16 +126,16 @@ def parse_pasted_table(text: str):
             parts = [p.strip() for p in ln.split(",")]
         parts += [""] * (5 - len(parts))
         desc, qty, unit, unit_price, total = parts[:5]
-        items.append({
+        it = {
             "description": desc,
             "qty": safe_float(qty),
             "unit": unit,
             "unit_price": safe_float(unit_price),
             "total": safe_float(total)
-        })
-    for it in items:
-        if it.get("total") is None and it.get("qty") is not None and it.get("unit_price") is not None:
+        }
+        if it["total"] is None and it["qty"] is not None and it["unit_price"] is not None:
             it["total"] = it["qty"] * it["unit_price"]
+        items.append(it)
     return items
 
 def extract_text_from_pdf(file_bytes: bytes):
@@ -190,14 +199,12 @@ def heuristic_items_from_text(txt: str):
         nums = re.findall(r"[-+]?\d+(?:\.\d+)?", line.replace(",", ""))
         if len(nums) < 2:
             continue
-        unit_price = safe_float(nums[-2]) if len(nums) >= 2 else None
-        total = safe_float(nums[-1]) if len(nums) >= 1 else None
+        unit_price = safe_float(nums[-2])
+        total = safe_float(nums[-1])
         qty = safe_float(nums[0])
         desc = re.sub(r"[-+]?\d+(?:\.\d+)?", " ", line)
         desc = re.sub(r"\s+", " ", desc).strip()
         if len(desc) < 3:
-            continue
-        if qty is None and unit_price is None and total is None:
             continue
         items.append({"description": desc, "qty": qty, "unit": "", "unit_price": unit_price, "total": total})
     return items[:80]
@@ -219,6 +226,7 @@ def build_comparison(quotes):
                 break
         if not placed:
             clusters.append({"key": d, "alts": [d]})
+
     rows = []
     for c in clusters:
         row = {"item": c["key"]}
@@ -231,9 +239,9 @@ def build_comparison(quotes):
                     best_score = score
                     best = it
             if best is not None and best_score >= 0.80:
-                row[f'{q["vendor"]} | unit_price'] = best.get("unit_price")
-                row[f'{q["vendor"]} | total'] = best.get("total")
-                row[f'{q["vendor"]} | qty'] = best.get("qty")
+                row[f'{q["vendor"]} | unit_price'] = safe_float(best.get("unit_price"))
+                row[f'{q["vendor"]} | total'] = safe_float(best.get("total"))
+                row[f'{q["vendor"]} | qty'] = safe_float(best.get("qty"))
             else:
                 row[f'{q["vendor"]} | unit_price'] = None
                 row[f'{q["vendor"]} | total'] = None
@@ -246,18 +254,18 @@ def add_flags(df: pd.DataFrame, vendors):
     for _, r in df.iterrows():
         prices = []
         for v in vendors:
-            p = r.get(f"{v} | unit_price", None)
-            if p is not None and not (isinstance(p, float) and np.isnan(p)):
-                prices.append(float(p))
+            p = safe_float(r.get(f"{v} | unit_price", None))
+            if p is not None:
+                prices.append(p)
         if not prices:
             continue
         mn = min(prices)
         for v in vendors:
-            p = r.get(f"{v} | unit_price", None)
-            if p is None or (isinstance(p, float) and np.isnan(p)):
-                flags.append((r["item"], v, "missing"))
+            p = safe_float(r.get(f"{v} | unit_price", None))
+            if p is None:
+                flags.append((r["item"], v, "missing price"))
             else:
-                if mn > 0 and float(p) > mn * 1.15:
+                if mn > 0 and p > mn * 1.15:
                     flags.append((r["item"], v, f"outlier >15% vs min ({mn:.2f})"))
     return flags
 
@@ -291,9 +299,9 @@ def generate_po_pdf(company_name, vendor, po_number, items, currency="AED"):
     grand = 0.0
     for it in items:
         desc = (it.get("description") or "")[:60]
-        qty = it.get("qty") or 0
-        up = it.get("unit_price") or 0
-        tot = it.get("total")
+        qty = safe_float(it.get("qty")) or 0
+        up = safe_float(it.get("unit_price")) or 0
+        tot = safe_float(it.get("total"))
         if tot is None:
             tot = qty * up
         grand += float(tot or 0)
@@ -312,7 +320,7 @@ def generate_po_pdf(company_name, vendor, po_number, items, currency="AED"):
     c.drawRightString(x+7.2*inch, y, f"Grand Total ({currency}): {grand:.2f}")
     y -= 0.3*inch
     c.setFont("Helvetica", 9)
-    c.drawString(x, y, "Notes: Demo PO generated by Quote-to-PO OS (v2.1).")
+    c.drawString(x, y, "Notes: Demo PO generated by Quote-to-PO OS (v2.2).")
     c.showPage()
     c.save()
     buf.seek(0)
@@ -332,16 +340,13 @@ def find_header_row(raw: pd.DataFrame):
             best = (i, score)
     return best[0], best[1]
 
-# ---------------------------
-# State
-# ---------------------------
 if "quotes" not in st.session_state:
     st.session_state.quotes = []
 if "company" not in st.session_state:
     st.session_state.company = "Demo Company LLC"
 
-st.title("Quote-to-PO OS — Interactive Demo (v2.1)")
-st.caption("Fixes: duplicate widget IDs + better Excel parsing (header-row selection) + filters noisy rows.")
+st.title("Quote-to-PO OS — Interactive Demo (v2.2)")
+st.caption("Fixes: ValueError in flags + safer numeric storage (no empty strings).")
 
 with st.sidebar:
     st.subheader("Demo Settings")
@@ -353,9 +358,6 @@ with st.sidebar:
 
 tab1, tab2, tab3, tab4 = st.tabs(["1) Add Quotes", "2) Review & Edit", "3) Compare", "4) Generate PO"])
 
-# ---------------------------
-# Tab 1: Add Quotes
-# ---------------------------
 with tab1:
     st.subheader("Add a supplier quote")
     colA, colB = st.columns([2, 1])
@@ -364,8 +366,7 @@ with tab1:
         currency = st.selectbox("Currency", CURRENCIES, index=0, key="currency_add")
         uploaded = st.file_uploader("Upload quote file (PDF, PNG/JPG, XLSX, CSV)", type=["pdf", "png", "jpg", "jpeg", "xlsx", "csv"], key="uploader_add")
     with colB:
-        pasted = st.text_area("Paste line items (desc|qty|unit|unit_price|total)", height=170, key="pasted_add",
-                              placeholder="Example:\nGypsum board 12mm | 50 | pcs | 22.5 |\nMetal stud 75mm | 100 | pcs | 8.0 |")
+        pasted = st.text_area("Paste line items (desc|qty|unit|unit_price|total)", height=170, key="pasted_add")
 
     items = []
     raw_text = ""
@@ -446,6 +447,9 @@ with tab1:
     st.subheader("Preview extracted/entered line items")
     if items:
         df_items = pd.DataFrame(items)
+        for col in ["qty","unit_price","total"]:
+            if col in df_items.columns:
+                df_items[col] = df_items[col].apply(safe_float)
         df_items["total"] = df_items.apply(lambda r: (r.get("qty") or 0)*(r.get("unit_price") or 0)
                                            if pd.isna(r.get("total")) or r.get("total") is None else r.get("total"), axis=1)
         st.dataframe(df_items, use_container_width=True)
@@ -457,17 +461,14 @@ with tab1:
                 "vendor": vendor.strip() or "Unknown Vendor",
                 "currency": currency,
                 "source_filename": uploaded.name if uploaded is not None else "pasted",
-                "items": df_items.fillna("").to_dict(orient="records"),
+                "items": df_items.where(pd.notnull(df_items), None).to_dict(orient="records"),
                 "status": "Draft"
             }
             st.session_state.quotes.append(q)
             st.success(f"Saved quote for {q['vendor']} with {len(q['items'])} items.")
     else:
-        st.info("Upload a file or paste items to create a quote. For Excel exports, set the correct header row.")
+        st.info("Upload a file or paste items to create a quote.")
 
-# ---------------------------
-# Tab 2: Review & Edit
-# ---------------------------
 with tab2:
     st.subheader("Review & edit quotes (human-in-the-loop)")
     if not st.session_state.quotes:
@@ -494,36 +495,24 @@ with tab2:
         else:
             for col in ["description","qty","unit","unit_price","total"]:
                 if col not in df.columns:
-                    df[col] = ""
+                    df[col] = None
 
             edited = st.data_editor(df[["description","qty","unit","unit_price","total"]],
                                     use_container_width=True, num_rows="dynamic", key=f"edit_table_{q['id']}")
 
-            def coerce(v):
-                try:
-                    return float(str(v).replace(",",""))
-                except:
-                    return None
-
-            edited2 = edited.copy()
-            for irow in range(len(edited2)):
-                qty = coerce(edited2.loc[irow, "qty"])
-                up = coerce(edited2.loc[irow, "unit_price"])
-                tot = coerce(edited2.loc[irow, "total"])
-                if tot is None and qty is not None and up is not None:
-                    edited2.loc[irow, "total"] = qty * up
+            for col in ["qty","unit_price","total"]:
+                edited[col] = edited[col].apply(safe_float)
+            edited["total"] = edited.apply(lambda r: (r.get("qty") or 0)*(r.get("unit_price") or 0)
+                                           if pd.isna(r.get("total")) or r.get("total") is None else r.get("total"), axis=1)
 
             if st.button("Save edits", type="primary", key=f"save_edit_{q['id']}"):
-                q["items"] = edited2.fillna("").to_dict(orient="records")
+                q["items"] = edited.where(pd.notnull(edited), None).to_dict(orient="records")
                 st.success("Saved.")
 
         if st.button("Delete this quote", type="secondary", key=f"del_{q['id']}"):
             st.session_state.quotes.pop(idx)
             st.warning("Deleted. Refresh selection.")
 
-# ---------------------------
-# Tab 3: Compare
-# ---------------------------
 with tab3:
     st.subheader("Compare suppliers")
     if len(st.session_state.quotes) < 2:
@@ -546,9 +535,6 @@ with tab3:
             else:
                 st.success("No flags detected with current rules.")
 
-# ---------------------------
-# Tab 4: Generate PO
-# ---------------------------
 with tab4:
     st.subheader("Generate a Purchase Order (PO)")
     if not st.session_state.quotes:
@@ -567,12 +553,12 @@ with tab4:
         else:
             edited = st.data_editor(df, use_container_width=True, num_rows="dynamic", key=f"po_table_{q['id']}")
             edited = edited[edited["description"].astype(str).str.strip() != ""]
+            for col in ["qty","unit_price","total"]:
+                if col in edited.columns:
+                    edited[col] = edited[col].apply(safe_float)
+
             if st.button("Generate PO PDF", type="primary", key="gen_po"):
-                items = edited.fillna("").to_dict(orient="records")
-                for it in items:
-                    it["qty"] = safe_float(it.get("qty"))
-                    it["unit_price"] = safe_float(it.get("unit_price"))
-                    it["total"] = safe_float(it.get("total"))
+                items = edited.where(pd.notnull(edited), None).to_dict(orient="records")
                 pdf_buf = generate_po_pdf(st.session_state.company, vendor, po_no, items, currency=currency)
                 st.download_button("Download PO PDF", data=pdf_buf.getvalue(),
                                    file_name=f"{po_no}.pdf", mime="application/pdf", key="dl_po")
@@ -581,4 +567,4 @@ with tab4:
         st.download_button("Download JSON", data=json.dumps(payload, indent=2).encode("utf-8"),
                            file_name="quote_to_po_demo_export.json", mime="application/json", key="dl_json")
 
-st.caption("v2.1: fixed duplicate widget IDs + improved Excel header-row handling + reduced noisy rows.")
+st.caption("v2.2: fixed ValueError in flags + safer numeric storage (no empty strings).")
